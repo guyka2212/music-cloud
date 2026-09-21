@@ -78,6 +78,9 @@ function showAuth({ mode = 'login' } = {}) {
         ? el('button', { class: 'linklike', type: 'button', text: 'Stop using GitHub sync for this browser', onclick: disableGhMode })
         : el('button', { class: 'linklike', type: 'button', text: 'Use GitHub sync (same library on every device)', onclick: showGhSetup }),
     ),
+    el('p', { class: 'hint', text: ghMode
+      ? 'Mode: GitHub sync — signing up will commit your account to the music-cloud repo.'
+      : 'Mode: local — your account will exist only in this browser.' }),
   );
 
   const aside = el('aside', { class: 'auth-aside' },
