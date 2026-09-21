@@ -1,20 +1,13 @@
-// Upload pipeline. Everything here happens in the browser:
-//   1. classify the file (audio vs other)
+// Upload pipeline. Files are stored as-is (no encryption) and committed to
+// the repo:   1. classify the file (audio vs other)
 //   2. read audio metadata (title/artist/album/duration/cover)
-//   3. generate a per-file key, wrap it with the master key
-//   4. encrypt the file (chunked for large files, single-shot for small)
-//   5. stream ciphertext chunks to the server, then finalize
-// Cancellation is honored between steps and between chunks.
+//   3. upload in ~4MB parts, then finalize
+// Cancellation is honored between steps and between parts.
 
 import { api } from './api.js';
 import { store } from './store.js';
-import {
-  newId, makeFileKeyRecord, encryptWithIv, deriveChunkIv,
-  CHUNK_SIZE, b64, decryptWithIv,
-} from './crypto.js';
+import { newId, CHUNK_SIZE } from './crypto.js';
 import { classifyFile, readAudioMetadata } from './metadata.js';
-
-const SINGLE_SHOT_LIMIT = 4 * 1024 * 1024;
 
 const uploadListeners = new Set();
 export function onUploadProgress(fn) {
@@ -72,7 +65,7 @@ async function uploadOne(file, folderId) {
   };
 
   try {
-    // 1. classify + metadata (plaintext, local only)
+    // 1. classify + metadata
     const { kind, playability } = classifyFile(file);
     let meta = null;
     if (kind === 'audio') {
@@ -81,24 +74,18 @@ async function uploadOne(file, folderId) {
     }
     throwIfAborted();
 
-    // 2. per-file key
-    const { handle: fileKey, record: keyRecord } = await makeFileKeyRecord(store.masterBits);
-
-    // 3. server-side blob slot
-    setStage('encrypting', 4);
-  const fileIv = crypto.getRandomValues(new Uint8Array(12));
-  await api.blobInit(blobId, store.docSalt || 'mc', b64.encode(fileIv));
+    // 2. blob slot
+    setStage('uploading', 4);
+    await api.blobInit(blobId);
     throwIfAborted();
 
-    // 4. encrypt + send
-    let ciphertextTotal = 0;
-    if (file.size <= SINGLE_SHOT_LIMIT) {
-      const plaintext = new Uint8Array(await file.arrayBuffer());
+    // 3. upload in parts
+    let part = 0;
+    if (file.size <= CHUNK_SIZE) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
       throwIfAborted();
-      setStage('uploading', 30);
-      const ct = await encryptWithIv(fileKey, fileIv, plaintext);
-      await api.putChunk(blobId, 0, ct, { signal: controller.signal });
-      ciphertextTotal = ct.byteLength;
+      await api.putChunk(blobId, 0, bytes);
+      part = 1;
       setStage('uploading', 96);
     } else {
       const chunkCount = Math.ceil(file.size / CHUNK_SIZE);
@@ -106,15 +93,13 @@ async function uploadOne(file, folderId) {
         throwIfAborted();
         const start = i * CHUNK_SIZE;
         const slice = new Uint8Array(await file.slice(start, Math.min(start + CHUNK_SIZE, file.size)).arrayBuffer());
-        const iv = deriveChunkIv(fileIv, i);
-        const ct = await encryptWithIv(fileKey, iv, slice);
-        await api.putChunk(blobId, i, ct, { signal: controller.signal });
-        ciphertextTotal += ct.byteLength;
+        await api.putChunk(blobId, i, slice);
+        part = i + 1;
         setStage('uploading', Math.round(4 + (i + 1) / chunkCount * 92));
       }
     }
 
-    // 5. finalize + register in the library doc
+    // 4. finalize + register in the library doc
     setStage('finishing', 98);
     await api.blobFinalize(blobId, file.size);
     const item = await store.addItem({
@@ -127,10 +112,8 @@ async function uploadOne(file, folderId) {
       mime: file.type || 'application/octet-stream',
       meta,
       playability,
-      keyRecord,
     });
     setStage('done', 100);
-    void ciphertextTotal;
     return item;
   } catch (err) {
     // Best-effort cleanup so failed uploads don't hold storage.
@@ -144,48 +127,11 @@ async function uploadOne(file, folderId) {
   }
 }
 
-// Decrypt-and-download helper shared by the player and the download action.
-// Small blobs are one GCM payload. Large uploads were sent as independently
-// encrypted chunks, each with IV = fileIV XOR chunkIndex, so we decrypt chunk
-// by chunk and concatenate the plaintexts.
+// Plain fetch-and-assemble shared by the player and the download action.
+// Large files were stored as consecutive parts; reassemble in order.
 export async function fetchDecryptedBlob(item, onProgress) {
   const res = await api.fetchBlob(item.blobId);
-  const ivHeader = res.headers.get('X-Blob-Iv');
-  const fileIv = ivHeader ? b64.decode(ivHeader) : null;
   const buf = new Uint8Array(await res.arrayBuffer());
-  if (onProgress) onProgress(55);
-  const fileKey = await store.unwrapKey(item);
-
-  let plaintext;
-  if (fileIv && item.size > CHUNK_SIZE) {
-    const parts = [];
-    let offset = 0;
-    let index = 0;
-    while (offset < buf.byteLength) {
-      // Each chunk ciphertext = GCM(ct || tag) for up to CHUNK_SIZE plaintext bytes.
-      const overhead = 16; // GCM tag
-      const maxCt = CHUNK_SIZE + overhead;
-      const take = Math.min(maxCt, buf.byteLength - offset);
-      const chunkCt = buf.subarray(offset, offset + take);
-      const iv = deriveChunkIv(fileIv, index);
-      parts.push(await decryptWithIv(fileKey, iv, chunkCt));
-      offset += take;
-      index += 1;
-    }
-    plaintext = concatBytes(parts);
-  } else if (fileIv) {
-    plaintext = await decryptWithIv(fileKey, fileIv, buf);
-  } else {
-    throw new Error('Missing decryption parameters');
-  }
   if (onProgress) onProgress(100);
-  return plaintext;
-}
-
-function concatBytes(parts) {
-  const total = parts.reduce((n, p) => n + p.byteLength, 0);
-  const out = new Uint8Array(total);
-  let o = 0;
-  for (const p of parts) { out.set(p, o); o += p.byteLength; }
-  return out;
+  return buf;
 }

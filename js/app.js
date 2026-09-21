@@ -1,16 +1,14 @@
-// App shell and views. Single page: auth -> unlock -> library.
+// App shell and views. Single page: shared library, no accounts.
+// Anyone can browse and play; a token unlocks uploading and editing.
 
-import { api, selectBackend, backendKind } from './api.js';
+import { api, selectBackend } from './api.js';
 import { store } from './store.js';
-import {
-  createAccountCredentials, loginCredentialsWithPassword, loginCredentialsWithRecovery,
-  generateSalt, b64, utf8,
-} from './crypto.js';
 import { el, fmt, promptDialog, confirmDialog, openDialog, openMenu, toast } from './ui.js';
 import { icon } from './icons.js';
 import { uploadFiles, onUploadProgress, cancelUpload, fetchDecryptedBlob } from './uploader.js';
 import { buildPlayerBar, playItem, guessMime } from './player.js';
 import { makeZip } from './zip.js';
+import { ghConfigured } from './gh.js';
 
 // Synchronous capability check: the browser tells us if it can decode this
 // container/codec. Unsupported formats still show up — with a download action
@@ -36,132 +34,21 @@ const state = {
   uploads: new Map(),
 };
 
-/* ================================================================ auth gate */
+/* ================================================================ write access */
 
-function showAuth({ mode = 'login' } = {}) {
-  document.title = 'music cloud';
-  const root = document.getElementById('app');
-  root.replaceChildren();
-  const isSignup = mode === 'signup';
+let canWrite = false; // true once a write-capable token is set
 
-  const email = el('input', { class: 'input', type: 'email', autocomplete: 'email', placeholder: 'you@example.com', id: 'auth-email' });
-  const password = el('input', { class: 'input', type: 'password', autocomplete: isSignup ? 'new-password' : 'current-password', placeholder: '••••••••••', id: 'auth-password' });
-  const submit = el('button', { class: 'btn primary wide', type: 'submit', text: isSignup ? 'Create account' : 'Sign in' });
-  const error = el('p', { class: 'form-error', role: 'alert' });
-
-  const form = el('form', { class: 'auth-form' },
-    el('div', { class: 'field' }, el('label', { class: 'field-label', for: 'auth-email', text: 'Email' }), email),
-    el('div', { class: 'field' },
-      el('label', { class: 'field-label', for: 'auth-password', text: 'Password' }),
-      password),
-    submit,
-    error,
-  );
-
-  const localMode = backendKind() === 'local';
-  const ghMode = backendKind() === 'github';
-
-  const card = el('div', { class: 'auth-card' },
-    el('div', { class: 'brand' }, icon('music', 20), el('span', { text: 'music cloud' })),
-    el('h1', { class: 'auth-title', text: isSignup ? 'Create your library' : 'Sign in' }),
-    el('p', { class: 'auth-sub', text: isSignup
-      ? 'Files are encrypted in this browser before anything leaves this device.'
-      : 'Your library is decrypted in this browser only.' }),
-    form,
-    el('div', { class: 'auth-switch' },
-      el('button', {
-        class: 'linklike', type: 'button',
-        text: isSignup ? 'Already have an account? Sign in' : 'Need an account? Create one',
-        onclick: () => showAuth({ mode: isSignup ? 'login' : 'signup' }),
-      }),
-      ghMode
-        ? el('button', { class: 'linklike', type: 'button', text: 'Stop using GitHub sync for this browser', onclick: disableGhMode })
-        : el('button', { class: 'linklike', type: 'button', text: 'Use GitHub sync (same library on every device)', onclick: showGhSetup }),
-    ),
-    el('p', { class: 'hint', text: ghMode
-      ? 'Mode: GitHub sync — signing up will commit your account to the music-cloud repo.'
-      : 'Mode: local — your account will exist only in this browser.' }),
-  );
-
-  const aside = el('aside', { class: 'auth-aside' },
-    el('h2', { class: 'aside-title', text: 'End-to-end encrypted' }),
-    el('p', {}, ghMode
-      ? 'GitHub sync: your encrypted library and account record are stored in the music-cloud repo (data/ folder). A GitHub token in this browser authorizes the commits; your password never leaves this device.'
-      : localMode
-        ? 'This is the static build: your account, library, and encrypted audio live in this browser (IndexedDB). Your password derives the key — it is never stored or uploaded.'
-        : 'Your password never leaves this device. It derives the key that encrypts your library and files. The server stores ciphertext only.'),
-    el('p', {}, 'No password, no access — there is no reset. A recovery key is shown once at signup; keep it somewhere safe.'),
-    localMode ? el('p', { class: 'hint' }, 'Because data lives in this browser, clearing site data deletes the library. Use the same browser profile to return to it.') : null,
-    ghMode ? el('p', { class: 'hint' }, 'Sign in with the same email and password on any device to reach the same library.') : null,
-  );
-
-  root.append(el('div', { class: 'auth-wrap' },
-    el('main', { class: 'auth-main' },
-      card,
-      el('p', { class: 'auth-recovery-link' },
-        el('button', { class: 'linklike', type: 'button', text: 'Sign in with recovery key', onclick: showRecoveryLogin })),
-    ),
-    aside,
-  ));
-
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    error.textContent = '';
-    submit.disabled = true;
-    const originalLabel = submit.textContent;
-    submit.textContent = isSignup ? 'Creating account…' : 'Deriving key…';
-    try {
-      const pw = password.value;
-      if (pw.length < 8) throw new Error('Password must be at least 8 characters.');
-      if (isSignup) {
-        // GitHub mode uses a deterministic per-email salt so every device
-        // derives the same key without a pre-auth lookup.
-        const salt = backendKind() === 'github'
-          ? (await api.salt(email.value.trim())).salt
-          : await generateSalt();
-        const { masterBits, authHash, recoveryKey } = await createAccountCredentials(pw, salt);
-        const recoveryHash = await sha256B64Url(utf8.encode(recoveryKey));
-        await api.signup(email.value.trim(), authHash, recoveryHash, salt);
-        localStorage.setItem('mc-salt', salt);
-        await startApp(masterBits);
-        showRecoveryKeyDialog(recoveryKey);
-      } else {
-        // Fetch this account's public KDF salt, then derive locally.
-        const { salt } = await api.salt(email.value.trim());
-        if (!salt) throw new Error('No key material found for that account.');
-        localStorage.setItem('mc-salt', salt);
-        const { masterBits, authHash } = await loginCredentialsWithPassword(pw, salt);
-        await api.login(email.value.trim(), authHash, null);
-        await startApp(masterBits);
-      }
-    } catch (err) {
-      error.textContent = err.message || 'Something went wrong.';
-    } finally {
-      submit.disabled = false;
-      submit.textContent = originalLabel;
-    }
-  });
-
-  if (isSignup) email.focus();
-  else password.focus();
-}
-
-async function sha256B64Url(bytes) {
-  const d = await crypto.subtle.digest('SHA-256', bytes);
-  return b64.encode(new Uint8Array(d));
-}
-
-function showGhSetup() {
+function showTokenSetup() {
   const tokenInput = el('input', { class: 'input', type: 'password', placeholder: 'github_pat_… or ghp_…', id: 'gh-token' });
   const err = el('p', { class: 'form-error', role: 'alert' });
   openDialog({
-    title: 'Use GitHub sync',
+    title: 'Enable uploading',
     width: 520,
     body: el('div', {},
       el('p', { class: 'dialog-message' },
-        'GitHub sync stores your encrypted library in the music-cloud repo so the same account works on every device. You need a GitHub token with Contents: read and write for this repository.'),
+        'Anyone can browse and play this library. To upload or make changes, paste a GitHub token with “Contents: Read and write” for the music-cloud repo. The token stays in this browser only.'),
       el('p', { class: 'hint' },
-        'Create a fine-grained token at GitHub → Settings → Developer settings → Fine-grained tokens. Select only this repository, permission “Contents: Read and write”. The token is kept in this browser only.'),
+        'Create one at GitHub → Settings → Developer settings → Fine-grained tokens. Select only this repository.'),
       el('div', { class: 'field' }, el('label', { class: 'field-label', for: 'gh-token', text: 'GitHub token' }), tokenInput),
       err,
     ),
@@ -183,7 +70,6 @@ function showGhSetup() {
               throw new Error('This token can read but not write. Re-create it with permission “Contents: Read and write”.');
             }
             localStorage.setItem('mc-gh-token', t);
-            localStorage.setItem('mc-backend', 'github');
             close();
             location.reload();
           } catch (e2) {
@@ -195,114 +81,41 @@ function showGhSetup() {
   });
 }
 
-function disableGhMode() {
-  localStorage.removeItem('mc-backend');
+function disableWriteAccess() {
   localStorage.removeItem('mc-gh-token');
   location.reload();
-}
-
-function showRecoveryLogin() {
-  const input = el('textarea', { class: 'input', rows: '2', placeholder: 'XXXXX-XXXXX-XXXXX-XXXXX-…', id: 'rk-input' });
-  const email = el('input', { class: 'input', type: 'email', placeholder: 'Account email', id: 'rk-email' });
-  const err = el('p', { class: 'form-error', role: 'alert' });
-  openDialog({
-    title: 'Sign in with recovery key',
-    width: 480,
-    body: el('div', {},
-      el('p', { class: 'dialog-message', text: 'The recovery key re-derives your library key on this device. Your usual password keeps working afterwards.' }),
-      el('div', { class: 'field' }, el('label', { class: 'field-label', for: 'rk-email', text: 'Email' }), email),
-      el('div', { class: 'field' }, el('label', { class: 'field-label', for: 'rk-input', text: 'Recovery key' }), input),
-      err,
-    ),
-    actions: [
-      { label: 'Cancel', onClick: (close) => close() },
-      {
-        label: 'Continue', kind: 'primary',
-        onClick: async (close) => {
-          err.textContent = '';
-          try {
-            const creds = await loginCredentialsWithRecovery(input.value);
-            if (!creds) throw new Error('That key does not look right. Check the groups and try again.');
-            await api.login(email.value.trim(), '', creds.recoveryHash);
-            // Remember the account's public KDF salt for future password logins
-            // on this device, then open the library with the recovered key.
-            try {
-              const { salt } = await api.salt(email.value.trim());
-              if (salt) localStorage.setItem('mc-salt', salt);
-            } catch { /* keep whatever is cached */ }
-            await startApp(creds.masterBits);
-            close();
-          } catch (e2) {
-            err.textContent = e2.message;
-          }
-        },
-      },
-    ],
-  });
-}
-
-function showRecoveryKeyDialog(recoveryKey) {
-  const keyText = el('code', { class: 'recovery-key', text: recoveryKey });
-  openDialog({
-    title: 'Save your recovery key',
-    width: 500,
-    body: el('div', {},
-      el('p', { class: 'dialog-message' },
-        'This is the only time we show your recovery key. If you ever lose your password, this is the only way back into your library.'),
-      el('div', { class: 'recovery-box' }, keyText),
-      el('p', { class: 'hint' }, '11 groups of 5 characters. Only a hash of it is stored — the key itself never leaves your devices.'),
-    ),
-    actions: [
-      {
-        label: 'Download .txt',
-        onClick: (close) => {
-          const blob = new Blob([`music cloud recovery key\n\n${recoveryKey}\n\nKeep this file somewhere safe — anyone with it can open your library.\n`], { type: 'text/plain' });
-          const a = el('a', { href: URL.createObjectURL(blob), download: 'music-cloud-recovery-key.txt' });
-          document.body.append(a); a.click(); a.remove();
-          setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
-          close();
-        },
-      },
-      { label: 'I saved it', kind: 'primary', onClick: (close) => close() },
-    ],
-  });
-}
-
-/* ================================================================ boot + start */
-
-let currentEmail = null; // display only; the real session lives in the driver
-
-async function startApp(masterBits) {
-  // The derived key lives in memory only; a page refresh asks for the password
-  // again. That is the standard tradeoff for end-to-end encrypted apps.
-  // Re-verify the session server-side (or driver-side) before rendering —
-  // a dashboard must never appear without a confirmed authenticated session.
-  try {
-    const me = await api.me();
-    if (!me || !me.user) throw new Error('Session missing');
-    currentEmail = me.user.email || currentEmail;
-  } catch (err) {
-    showAuth({ mode: 'login' });
-    if (err && err.message && err.message !== 'Session missing') throw err;
-    return;
-  }
-  await store.load(masterBits);
-  buildShell();
-  render();
 }
 
 async function boot() {
   setupThemeToggle();
   await selectBackend();
-  // The session may still be valid, but the encryption key only exists after
-  // this device derives it — so the password is always required here.
-  showAuth({ mode: 'login' });
+  canWrite = ghConfigured();
+  try {
+    await store.load();
+  } catch (err) {
+    renderLoadError(err);
+    return;
+  }
+  buildShell();
+  render();
 }
 
-function signOut() {
-  api.logout().finally(() => {
-    location.reload();
-  });
+function renderLoadError(err) {
+  const root = document.getElementById('app');
+  const msg = (err && err.status === 403)
+    ? 'GitHub rate limit reached for anonymous requests. Add a token (it raises the limit and enables uploading).'
+    : 'Could not load the shared library from GitHub. Check your connection and refresh.';
+  root.replaceChildren(el('div', { class: 'auth-wrap' },
+    el('main', { class: 'auth-main' },
+      el('div', { class: 'auth-card' },
+        el('div', { class: 'brand' }, icon('music', 20), el('span', { text: 'music cloud' })),
+        el('h1', { class: 'auth-title', text: 'Library unavailable' }),
+        el('p', { class: 'auth-sub', text: msg }),
+        el('div', { class: 'auth-switch' },
+          el('button', { class: 'btn primary', type: 'button', text: 'Retry', onclick: () => location.reload() }),
+          el('button', { class: 'linklike', type: 'button', text: 'Add a token', onclick: showTokenSetup }))),
+    ),
+  ));
 }
 
 /* ================================================================ shell */
@@ -404,6 +217,9 @@ function buildSidebar(sidebar) {
   const meterBar = el('div', { class: 'meter-bar' }, el('div', { class: 'meter-fill' }));
   const meterLabel = el('div', { class: 'meter-label' });
   const meter = el('div', { class: 'storage-meter' }, meterBar, meterLabel);
+  const hint = el('div', { class: 'side-hint', text: canWrite
+    ? 'Uploading enabled — changes save to the shared repo.'
+    : 'Read-only: browse and play. Enable uploading to add files.' });
 
   sidebar.append(
     el('div', { class: 'side-top' },
@@ -412,10 +228,11 @@ function buildSidebar(sidebar) {
     ),
     nav,
     meter,
+    hint,
     el('div', { class: 'side-footer' },
       el('button', { class: 'icon-btn', 'aria-label': 'Toggle light or dark theme', onclick: toggleTheme }),
-      el('button', { class: 'side-link small', type: 'button', onclick: signOut }, icon('log-out', 16), el('span', { text: 'Sign out' })),
-      currentEmail ? el('div', { class: 'side-email', title: currentEmail, text: currentEmail }) : null,
+      el('button', { class: 'side-link small', type: 'button', onclick: canWrite ? disableWriteAccess : showTokenSetup },
+        icon('key', 16), el('span', { text: canWrite ? 'Disable uploading' : 'Enable uploading' })),
     ),
   );
 
@@ -1108,4 +925,4 @@ onUploadProgress((job) => {
 /* ================================================================ boot */
 
 boot();
-void backendKind;
+

@@ -1,11 +1,9 @@
-// Library store: owns the decrypted library document and all mutations.
-// One encrypted JSON document per user; every save is read-modify-write with a
-// retry on IV conflict (another tab may have saved meanwhile).
+// Library store: owns the shared library document and all mutations.
+// One public JSON document; every save is read-modify-write so concurrent
+// visitors never lose each other's changes.
 
 import { api } from './api.js';
-import {
-  encryptJson, decryptJson, newId,
-} from './crypto.js';
+import { newId } from './crypto.js';
 
 const EMPTY_LIBRARY = () => ({
   version: 1,
@@ -16,9 +14,8 @@ const EMPTY_LIBRARY = () => ({
 });
 
 export const store = {
-  masterBits: null,
   doc: null,
-  docSalt: '',
+  lastSaved: null,
   listeners: new Set(),
 
   onChange(fn) {
@@ -30,65 +27,41 @@ export const store = {
     for (const fn of this.listeners) fn();
   },
 
-  // Called after auth; loads + decrypts (or initializes) the library document.
-  async load(masterBits) {
-    this.masterBits = masterBits;
+  async load() {
     const res = await api.getLibrary();
-    this.docSalt = res.salt || '';
-    // Persist the doc salt for this device so password logins can re-derive the
-    // master key without the recovery key (e.g. first login on a new device).
-    if (this.docSalt) {
-      try { localStorage.setItem('mc-salt', this.docSalt); } catch { /* private mode */ }
-    }
-    if (!res.ct) {
+    if (!res || !res.folders || !res.folders.root) {
       this.doc = EMPTY_LIBRARY();
-      const root = {
-        id: 'root', name: 'My Library', parent: null, createdAt: Date.now(), trashed: false,
+      this.doc.folders.root = {
+        id: 'root', name: 'Shared Music', parent: null, createdAt: Date.now(), trashed: false,
       };
-      this.doc.folders.root = root;
-      await this.save();
+      await this.save(null, 'mc: init library');
       return this.doc;
     }
-    try {
-      this.doc = await decryptJson(this.masterBits, res.iv, res.ct);
-      this.lastIv = res.iv;
-    } catch {
-      const err = new Error('DECRYPT_FAILED');
-      err.code = 'DECRYPT_FAILED';
-      throw err;
-    }
-    if (!this.doc.folders || !this.doc.folders.root) {
-      this.doc.folders.root = {
-        id: 'root', name: 'My Library', parent: null, createdAt: Date.now(), trashed: false,
-      };
-    }
+    this.doc = res;
+    this.lastSaved = JSON.stringify(res);
     return this.doc;
   },
 
-  // Save flow: pull the latest server copy first (multi-tab safety), merge in
-  // anything we don't have, then apply the mutation and push. On a 409/refresh
-  // conflict we retry with a fresh pull.
-  async save(mutator) {
-    if (!this.masterBits) throw new Error('not signed in');
+  async save(mutator, message) {
+    // Pull the latest copy, apply the mutation, push. A 409 means someone else
+    // committed between our read and write; retry with a fresh pull.
     for (let attempt = 0; attempt < 4; attempt++) {
       const res = await api.getLibrary();
-      if (res.ct && res.iv !== this.lastIv) {
-        // Server has a version we didn't write — merge it in before mutating.
-        try {
-          this.mergeServerDoc(await decryptJson(this.masterBits, res.iv, res.ct));
-        } catch {
-          /* undecryptable server copy (e.g. key rotated in another tab); ours wins */
+      if (res && res.folders && res.folders.root) {
+        if (this.lastSaved !== JSON.stringify(res)) {
+          // Someone else changed the library since we loaded it — merge.
+          this.mergeServerDoc(res);
         }
       }
       if (typeof mutator === 'function') mutator(this.doc);
-      const { iv, ct } = await encryptJson(this.masterBits, this.doc);
-      this.lastIv = iv;
+      const serialized = JSON.stringify(this.doc);
       try {
-        await api.saveLibrary(this.docSalt, iv, ct);
+        await api.saveLibrary(this.doc, message);
+        this.lastSaved = serialized;
         this.emit();
         return;
       } catch (err) {
-        if (err.status >= 500 || err.status === 429) {
+        if (err.status === 409 || err.status >= 500 || err.status === 429) {
           await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
           continue;
         }
@@ -99,16 +72,14 @@ export const store = {
   },
 
   mergeServerDoc(serverDoc) {
-    const local = this.doc;
     for (const [id, f] of Object.entries(serverDoc.folders || {})) {
-      const mine = local.folders[id];
-      if (!mine || (f.updatedAt || 0) > (mine.updatedAt || 0)) local.folders[id] = f;
+      const mine = this.doc.folders[id];
+      if (!mine || (f.updatedAt || 0) > (mine.updatedAt || 0)) this.doc.folders[id] = f;
     }
     for (const [id, it] of Object.entries(serverDoc.items || {})) {
-      const mine = local.items[id];
-      if (!mine || (it.updatedAt || 0) > (mine.updatedAt || 0)) local.items[id] = it;
+      const mine = this.doc.items[id];
+      if (!mine || (it.updatedAt || 0) > (mine.updatedAt || 0)) this.doc.items[id] = it;
     }
-    // settings/view stay local (per-tab preference wins)
   },
 
   // ---------------------------------------------------------------- folders
@@ -118,7 +89,7 @@ export const store = {
     const folder = {
       id, name, parent: parentId, createdAt: Date.now(), updatedAt: Date.now(), trashed: false,
     };
-    return this.save((doc) => { doc.folders[id] = folder; }).then(() => folder);
+    return this.save((doc) => { doc.folders[id] = folder; }, `mc: folder ${name}`).then(() => folder);
   },
 
   renameFolder(id, name) {
@@ -127,11 +98,10 @@ export const store = {
         doc.folders[id].name = name;
         doc.folders[id].updatedAt = Date.now();
       }
-    });
+    }, `mc: rename folder`);
   },
 
   moveFolder(id, newParent) {
-    // Cycle check.
     let p = newParent;
     while (p) {
       if (p === id) return Promise.reject(new Error('Cannot move a folder into itself.'));
@@ -142,7 +112,7 @@ export const store = {
         doc.folders[id].parent = newParent;
         doc.folders[id].updatedAt = Date.now();
       }
-    });
+    }, 'mc: move folder');
   },
 
   trashFolder(id, trashedAt = Date.now()) {
@@ -154,7 +124,7 @@ export const store = {
       for (const it of Object.values(doc.items)) {
         if (ids.includes(it.folderId)) { it.trashed = true; it.trashedAt = trashedAt; }
       }
-    });
+    }, 'mc: trash folder');
   },
 
   restoreFolder(id) {
@@ -171,7 +141,7 @@ export const store = {
         if (ids.includes(it.folderId)) { it.trashed = false; delete it.trashedAt; }
       }
       if (parentMissing || !folder.parent) doc.folders[id].parent = 'root';
-    });
+    }, 'mc: restore folder');
   },
 
   async deleteFolderForever(id) {
@@ -186,7 +156,7 @@ export const store = {
       for (const [iid, it] of Object.entries(doc.items)) {
         if (ids.includes(it.folderId)) delete doc.items[iid];
       }
-    });
+    }, 'mc: delete folder');
   },
 
   folderSubtree(id) {
@@ -212,8 +182,6 @@ export const store = {
   // ---------------------------------------------------------------- items (files)
 
   async addItem(record) {
-    // record.keyRecord is the per-file key already wrapped with the master key
-    // by the uploader — the same key that encrypted the bytes on the server.
     const item = {
       id: record.id,
       blobId: record.blobId,
@@ -225,12 +193,10 @@ export const store = {
       createdAt: Date.now(),
       updatedAt: Date.now(),
       trashed: false,
-      key: record.keyRecord,
-      // audio metadata (parsed client-side at upload time):
       meta: record.meta || null,
       playability: record.playability || 'unknown',
     };
-    await this.save((doc) => { doc.items[item.id] = item; });
+    await this.save((doc) => { doc.items[item.id] = item; }, `mc: add ${record.name}`);
     return item;
   },
 
@@ -240,7 +206,7 @@ export const store = {
         doc.items[id].name = name;
         doc.items[id].updatedAt = Date.now();
       }
-    });
+    }, 'mc: rename file');
   },
 
   moveItem(id, newFolderId) {
@@ -249,13 +215,13 @@ export const store = {
         doc.items[id].folderId = newFolderId;
         doc.items[id].updatedAt = Date.now();
       }
-    });
+    }, 'mc: move file');
   },
 
   trashItem(id, trashedAt = Date.now()) {
     return this.save((doc) => {
       if (doc.items[id]) { doc.items[id].trashed = true; doc.items[id].trashedAt = trashedAt; }
-    });
+    }, 'mc: trash file');
   },
 
   restoreItem(id) {
@@ -266,14 +232,14 @@ export const store = {
       delete it.trashedAt;
       const f = doc.folders[it.folderId];
       if (it.folderId !== 'root' && (!f || f.trashed)) it.folderId = 'root';
-    });
+    }, 'mc: restore file');
   },
 
   async deleteItemForever(id) {
     const item = this.doc.items[id];
     if (item) {
       await api.blobDelete(item.blobId).catch(() => {});
-      await this.save((doc) => { delete doc.items[id]; });
+      await this.save((doc) => { delete doc.items[id]; }, `mc: delete ${item.name}`);
     }
   },
 
@@ -291,7 +257,7 @@ export const store = {
           delete doc.items[it.id];
         }
       }
-    });
+    }, 'mc: empty trash');
   },
 
   // ---------------------------------------------------------------- queries
@@ -316,11 +282,6 @@ export const store = {
       return hay.includes(q);
     });
     return { folders, items };
-  },
-
-  async unwrapKey(item) {
-    const { unwrapFileKey } = await import('./crypto.js');
-    return unwrapFileKey(this.masterBits, item.key);
   },
 
   storageUsed() {
