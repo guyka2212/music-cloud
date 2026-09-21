@@ -119,11 +119,11 @@ function showAuth({ mode = 'login' } = {}) {
         const salt = backendKind() === 'github'
           ? (await api.salt(email.value.trim())).salt
           : await generateSalt();
-        const { authHash, recoveryKey } = await createAccountCredentials(pw, salt);
+        const { masterBits, authHash, recoveryKey } = await createAccountCredentials(pw, salt);
         const recoveryHash = await sha256B64Url(utf8.encode(recoveryKey));
         await api.signup(email.value.trim(), authHash, recoveryHash, salt);
         localStorage.setItem('mc-salt', salt);
-        await startApp(null, pw);
+        await startApp(masterBits);
         showRecoveryKeyDialog(recoveryKey);
       } else {
         // Fetch this account's public KDF salt, then derive locally.
@@ -132,7 +132,7 @@ function showAuth({ mode = 'login' } = {}) {
         localStorage.setItem('mc-salt', salt);
         const { masterBits, authHash } = await loginCredentialsWithPassword(pw, salt);
         await api.login(email.value.trim(), authHash, null);
-        await startApp(masterBits, pw);
+        await startApp(masterBits);
       }
     } catch (err) {
       error.textContent = err.message || 'Something went wrong.';
@@ -178,6 +178,10 @@ function showGhSetup() {
             });
             if (r.status === 401) throw new Error('GitHub rejected this token (401).');
             if (!r.ok) throw new Error(`Token check failed (${r.status}). Make sure it can access guyka2212/music-cloud.`);
+            const repo = await r.json();
+            if (!repo.permissions || repo.permissions.push !== true) {
+              throw new Error('This token can read but not write. Re-create it with permission “Contents: Read and write”.');
+            }
             localStorage.setItem('mc-gh-token', t);
             localStorage.setItem('mc-backend', 'github');
             close();
