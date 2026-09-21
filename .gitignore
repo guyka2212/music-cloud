@@ -3,3 +3,8 @@ node_modules/
 .DS_Store
 .env
 data-test/
+# Server-mode runtime database; the tracked data/*.json + data/files/ are the
+# encrypted GitHub-sync store and must stay tracked.
+data/music-cloud.db
+data/music-cloud.db-shm
+data/music-cloud.db-wal
