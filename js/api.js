@@ -46,7 +46,9 @@ function makeServerApi() {
     async probe() {
       try {
         const r = await fetch('/api/auth/me', { credentials: 'same-origin' });
-        return r.ok || r.status === 401;
+        // A real server answers JSON. A static host's SPA fallback answers
+        // 200 with HTML — that must NOT count as a server.
+        return (r.headers.get('content-type') || '').includes('application/json');
       } catch { return false; }
     },
     signup: (email, authHash, recoveryHash, kdfSalt) =>
@@ -133,6 +135,18 @@ function bytesFromB64(str) {
   const out = new Uint8Array(s.length);
   for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
   return out;
+}
+void bytesFromB64;
+
+// Static hosting (GitHub Pages etc.) can never serve the API — skip probing
+// entirely there so a 200-HTML fallback can't fool the server driver.
+function isStaticHost() {
+  try {
+    const h = globalThis.location.hostname;
+    return h === 'github.io' || h.endsWith('.github.io');
+  } catch {
+    return false;
+  }
 }
 
 const SESSION_KEY = 'mc-local-session';
@@ -323,7 +337,12 @@ export async function selectBackend() {
     probing = (async () => {
       const pref = localStorage.getItem('mc-backend') || 'auto';
       if (pref === 'local') return makeLocalApi();
-      if (pref === 'server') return makeServerApi();
+      if (pref === 'server' && !isStaticHost()) return makeServerApi();
+      if (pref === 'server') {
+        // Requested server mode on a static host: server cannot exist.
+        return makeLocalApi();
+      }
+      if (isStaticHost()) return makeLocalApi();
       const server = makeServerApi();
       const serverUp = await server.probe();
       return serverUp ? server : makeLocalApi();

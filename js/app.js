@@ -185,7 +185,7 @@ function showRecoveryKeyDialog(recoveryKey) {
       el('p', { class: 'dialog-message' },
         'This is the only time we show your recovery key. If you ever lose your password, this is the only way back into your library.'),
       el('div', { class: 'recovery-box' }, keyText),
-      el('p', { class: 'hint' }, '11 groups of 5 characters. The server stores only a hash of it.'),
+      el('p', { class: 'hint' }, '11 groups of 5 characters. Only a hash of it is stored — the key itself never leaves your devices.'),
     ),
     actions: [
       {
