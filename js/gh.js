@@ -1,18 +1,22 @@
 // GitHub-backed driver. Data lives as files under data/ in the music-cloud
 // repo, read/written through GitHub's Contents API with a pasted token.
 //
-//   data/users/<h>.rec     one encrypted record per account { email, authHash,
-//                          recoveryHash, kdfSalt, createdAt }
-//   data/lib/<h>.json      per-account library doc { salt, iv, ct }
-//   data/blob/<h>/<id>.enc encrypted audio bytes (single PUT, <20MB per file)
+//   data/users.json            every account in one file. A public index maps
+//                              SHA-256(email) -> entry key; each entry is an
+//                              AES-GCM envelope { email, authHash,
+//                              recoveryHash, kdfSalt, createdAt } keyed by
+//                              SHA-256(email ':' authHash).
+//   data/files/<h>.json        per-account library doc { salt, iv, ct }
+//   data/files/<h>/<id>.json   blob manifest { v, iv, salt, size, parts }
+//   data/files/<h>/<id>/pN.enc encrypted ~4MB chunks
 //
-// h = SHA-256(email ':' authHash) hex. Filename and record decryption both
-// require email AND password, so the public repo leaks nothing usable.
-// The token lives in localStorage only; data files are repo-committed.
+// Entry keys require email AND password to compute, so the public repo leaks
+// nothing usable. The token lives in localStorage only; data files are
+// repo-committed.
 
 const GH_API = 'https://api.github.com';
-const REPO = 'guyka2212/music-cloud';
-const BRANCH = 'main';
+export const REPO = 'guyka2212/music-cloud';
+export const BRANCH = 'main';
 
 class ApiError extends Error {
   constructor(status, message) {
@@ -133,7 +137,7 @@ async function getSha(path) {
   }
 }
 
-async function putFile(path, bytes, message) {
+export async function putFile(path, bytes, message) {
   const sha = await getSha(path);
   const body = { message, branch: BRANCH, content: b64Encode(bytes) };
   if (sha) body.sha = sha;
@@ -141,53 +145,61 @@ async function putFile(path, bytes, message) {
   return { created: !sha };
 }
 
-async function readFileRaw(path) {
+export async function readFileRaw(path) {
   const r = await ghRequest('GET', `/repos/${REPO}/contents/${encPath(path)}?ref=${BRANCH}`, undefined, true);
   return new Uint8Array(await r.arrayBuffer());
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// ---------------------------------------------------------------- account records
+// ---------------------------------------------------------------- accounts
 
-function accountPath(h) { return `data/users/${h}.rec`; }
-function libPath(h) { return `data/lib/${h}.json`; }
+// All accounts live in ONE JSON file. The email-hash -> entry-key index is
+// public; every entry is separately encrypted and its key requires the email
+// AND that account's authHash, so entries are unreadable without the password.
+const USERS_DB_PATH = 'data/users.json';
 
-// Public pointer file for recovery login: SHA-256(email) -> record filename.
-// Reveals that an email has an account; nothing beyond that.
-async function pointerHash(email) {
+function libPath(h) { return `data/files/${h}.json`; }
+
+export function pointerHash(email) {
   return h64(`ptr:${email}`);
 }
 
-async function readPointer(email) {
-  const ph = await pointerHash(email);
-  try {
-    const raw = await readFileRaw(`data/ptr/${ph}.json`);
-    return JSON.parse(new TextDecoder().decode(raw));
-  } catch (e) {
-    if (e.status === 404) return null;
-    throw e;
-  }
+// Exported for scripts/create-user.mjs so terminal-created accounts are
+// sealed exactly like browser signups.
+export function usersEntryKey(email, authHash) {
+  return h64(`${email}:${authHash}`);
+}
+export function deterministicSaltFor(email) {
+  return deterministicSalt(email);
+}
+export async function sealUserEntry(k, obj) {
+  return sealEntry(k, obj);
 }
 
-async function writePointer(email, h) {
-  const ph = await pointerHash(email);
-  await putFile(
-    `data/ptr/${ph}.json`,
-    enc.encode(JSON.stringify({ h })),
-    `mc: pointer ${ph.slice(0, 10)}`,
-  );
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
 }
 
-async function readRecord(h) {
-  const raw = await readFileRaw(accountPath(h)).catch((e) => {
-    if (e.status === 404) return null;
-    throw e;
-  });
-  if (!raw || !raw.length) return null;
-  const env = JSON.parse(new TextDecoder().decode(raw));
-  // Record key derives from h itself (email + authHash), never stored.
-  const keyBits = await hkdfBits(hexToBytes(h), 'account-record');
+async function sealEntry(k, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const keyBits = await hkdfBits(hexToBytes(k), 'account-record');
+  const key = await subtle().importKey('raw', keyBits, 'AES-GCM', false, ['encrypt']);
+  const ct = new Uint8Array(await subtle().encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    enc.encode(JSON.stringify(obj)),
+  ));
+  return {
+    iv: b64Encode(iv),
+    ct: b64Encode(ct),
+  };
+}
+
+async function openEntry(k, env) {
+  const keyBits = await hkdfBits(hexToBytes(k), 'account-record');
   const key = await subtle().importKey('raw', keyBits, 'AES-GCM', false, ['decrypt']);
   const pt = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: b64Decode(env.iv) },
@@ -197,36 +209,30 @@ async function readRecord(h) {
   return JSON.parse(new TextDecoder().decode(pt));
 }
 
-async function writeRecord(h, rec, message) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const keyBits = await hkdfBits(hexToBytes(h), 'account-record');
-  const key = await subtle().importKey('raw', keyBits, 'AES-GCM', false, ['encrypt']);
-  const ct = new Uint8Array(await subtle().encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    enc.encode(JSON.stringify(rec)),
-  ));
-  const file = { v: 1, iv: b64Encode(iv), ct: b64Encode(ct) };
-  await putFile(accountPath(h), enc.encode(JSON.stringify(file)), message);
+async function readUsersDb() {
+  const raw = await readFileRaw(USERS_DB_PATH).catch((e) => {
+    if (e.status === 404) return null;
+    throw e;
+  });
+  if (!raw || !raw.length) return null;
+  try { return JSON.parse(new TextDecoder().decode(raw)); } catch { return null; }
 }
 
-function hexToBytes(hex) {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  return out;
+async function writeUsersDb(db, message) {
+  await putFile(USERS_DB_PATH, enc.encode(JSON.stringify(db)), message);
 }
 
 // ---------------------------------------------------------------- blobs
 
 // Layout per blob (all ciphertext parts are independent AES-GCM payloads):
-//   data/blob/<h>/<id>.json      manifest { v, iv, salt, size, parts: N }
-//   data/blob/<h>/<id>/p0.enc    part 0 ciphertext (~4MB plaintext per part)
-//   data/blob/<h>/<id>/p1.enc    ...
+//   data/files/<h>/<id>.json      manifest { v, iv, salt, size, parts: N }
+//   data/files/<h>/<id>/p0.enc    part 0 ciphertext (~4MB plaintext per part)
+//   data/files/<h>/<id>/p1.enc    ...
 // One Contents commit per part sidesteps the API's 25MB request cap, so file
 // size is bounded only by patience (GitHub recommends repos stay under 1-5GB).
 
-function blobManifestPath(h, id) { return `data/blob/${h}/${id}.json`; }
-function blobPartPath(h, id, i) { return `data/blob/${h}/${id}/p${i}.enc`; }
+function blobManifestPath(h, id) { return `data/files/${h}/${id}.json`; }
+function blobPartPath(h, id, i) { return `data/files/${h}/${id}/p${i}.enc`; }
 const MAX_PARTS_DELETE = 10_000; // safety stop for blobDelete's part sweep
 
 async function putBlobManifest(h, id, meta, partCount, message) {
@@ -283,41 +289,52 @@ export function makeGhApi() {
 
     async signup(emailIn, authHash, recoveryHash, kdfSalt) {
       const email = String(emailIn || '').trim().toLowerCase();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new ApiError(400, 'Enter a valid email address.');
-      const h = await h64(`${email}:${authHash}`);
-      const existing = await readRecord(h).catch(() => null);
-      if (existing) throw new ApiError(409, 'An account with this email already exists.');
-      const rec = {
-        email,
-        authHash,
-        recoveryHash: recoveryHash || null,
-        kdfSalt: kdfSalt || '',
-        createdAt: Date.now(),
-      };
-      await writeRecord(h, rec, `mc: signup ${h.slice(0, 10)}`);
-      await writePointer(email, h);
-      sessionEmail = email; sessionH = h; sessionAuthHash = authHash;
-      return { ok: true, userId: h, kdfSalt };
+      if (!/^[^\s@]+@[^^\s@]+\.[^\s@]+$/.test(email)) throw new ApiError(400, 'Enter a valid email address.');
+      const k = await usersEntryKey(email, authHash);
+      // Read-modify-write users.json; GitHub answers 409 on sha mismatch when
+      // another client wrote between our read and write, so retry.
+      for (let attempt = 0; ; attempt++) {
+        const db = (await readUsersDb()) || { v: 2, users: {}, ptr: {} };
+        if (db.users && db.users[k]) throw new ApiError(409, 'An account with this email already exists.');
+        db.users = db.users || {}; db.ptr = db.ptr || {};
+        const rec = {
+          email,
+          authHash,
+          recoveryHash: recoveryHash || null,
+          kdfSalt: kdfSalt || '',
+          createdAt: Date.now(),
+        };
+        db.users[k] = await sealEntry(k, rec);
+        db.ptr[await pointerHash(email)] = k;
+        try {
+          await writeUsersDb(db, `mc: signup ${k.slice(0, 10)}`);
+          break;
+        } catch (e) {
+          if (e.status !== 409 || attempt >= 3) throw e;
+        }
+      }
+      sessionEmail = email; sessionH = k; sessionAuthHash = authHash;
+      return { ok: true, userId: k, kdfSalt };
     },
 
     async login(emailIn, authHash, recoveryHash) {
       const email = String(emailIn || '').trim().toLowerCase();
+      const db = await readUsersDb();
       if (recoveryHash) {
-        // Recovery login: locate the account via the public pointer file
-        // (email hash -> record filename), which reveals nothing usable.
-        const ptr = await readPointer(email);
-        if (!ptr) throw new ApiError(401, 'Incorrect email or recovery key.');
+        // Recovery login: the public index maps email hash -> entry key,
+        // revealing only that an account exists.
+        const k = db && db.ptr ? db.ptr[await pointerHash(email)] : null;
         let rec = null;
-        try { rec = await readRecord(ptr.h); } catch { rec = null; }
+        if (k && db.users && db.users[k]) rec = await openEntry(k, db.users[k]).catch(() => null);
         if (!rec || rec.recoveryHash !== recoveryHash) throw new ApiError(401, 'Incorrect email or recovery key.');
-        sessionEmail = rec.email; sessionH = ptr.h; sessionAuthHash = rec.authHash;
+        sessionEmail = rec.email; sessionH = k; sessionAuthHash = rec.authHash;
         return { ok: true };
       }
-      const h = await h64(`${email}:${authHash || ''}`);
+      const k = await usersEntryKey(email, authHash || '');
       let rec = null;
-      try { rec = await readRecord(h); } catch { rec = null; }
+      if (db && db.users && db.users[k]) rec = await openEntry(k, db.users[k]).catch(() => null);
       if (!rec || rec.email !== email) throw new ApiError(401, 'Incorrect email or password.');
-      sessionEmail = email; sessionH = h; sessionAuthHash = authHash;
+      sessionEmail = email; sessionH = k; sessionAuthHash = authHash;
       return { ok: true };
     },
 

@@ -1,7 +1,7 @@
 // End-to-end test of the GitHub driver against a mock Contents API.
-// Verifies: signup → record + pointer files, password login, recovery login,
-// salt determinism, library doc round-trip, blob upload/download/delete, and
-// per-account isolation. Run: node test/gh.test.js
+// Verifies: signup → one encrypted users.json entry, password login, recovery
+// login, salt determinism, library doc round-trip, blob upload/download/delete,
+// per-account isolation, and that no plaintext lands in the repo. Run: node test/gh.test.js
 
 // ---- minimal browser globals the driver expects -------------------------
 const store = new Map(); // localStorage
@@ -35,6 +35,12 @@ function bodyBytes(body) {
   if (!body) return new Uint8Array();
   if (typeof body === 'string') return new TextEncoder().encode(body);
   return body instanceof Uint8Array ? body : new Uint8Array(body);
+}
+
+// Recreate the driver's entry-key derivation for direct db inspection.
+async function a2key(email, authHash) {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${email}:${authHash}`));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 function jsonResponse(obj, status = 200) {
@@ -102,8 +108,16 @@ const saltA = (await a.salt('a@test.dev')).salt;
 assert(saltA && saltA.length > 0, 'deterministic salt returned pre-auth');
 const signupA = await a.signup('a@test.dev', authA, 'recoveryhash-a', saltA);
 assert(signupA.ok, 'signup A ok');
-assert(files.size >= 2, `record + pointer committed (${files.size} files)`);
+assert(files.has('/data/users.json'), 'users.json committed on signup');
 assert(commitLog.length && commitLog.every((p) => p.startsWith('data/')), 'all writes are under data/');
+
+// The single users file must leak nothing readable.
+const usersRaw = new TextDecoder().decode(b64d(files.get('/data/users.json').content));
+const usersDb = JSON.parse(usersRaw);
+assert(usersDb.v === 2 && usersDb.users && usersDb.ptr, 'users.json has index + entries');
+assert(!usersRaw.includes('a@test.dev'), 'email never stored in plaintext');
+assert(!usersRaw.includes(authA) && !usersRaw.includes('recoveryhash-a'), 'auth/recovery hashes never in plaintext');
+const kA = await a2key('a@test.dev', authA);
 
 // library round trip
 await a.saveLibrary(saltA, 'iv-a', 'ct-a');
@@ -143,6 +157,16 @@ await b.signup('b@test.dev', 'authhash-b', 'recoveryhash-b', (await b.salt('b@te
 await b.saveLibrary('salt-b', 'iv-b', 'ct-b');
 const libB = await b.getLibrary();
 assert(libB.ct === 'ct-b', 'account B sees only its own library');
+
+// Both accounts coexist in the one users.json.
+const db2 = JSON.parse(new TextDecoder().decode(b64d(files.get('/data/users.json').content)));
+assert(Object.keys(db2.users).length === 2, 'both accounts live in the single users.json');
+assert(Object.keys(db2.users).includes(kA), 'account A entry survives B signing up');
+assert(!usersHasEmail(db2), 'no plaintext emails even with two accounts');
+function usersHasEmail(db) {
+  const raw = JSON.stringify(db);
+  return raw.includes('@test.dev');
+}
 
 const a2 = makeGhApi();
 await a2.login('a@test.dev', authA, null);

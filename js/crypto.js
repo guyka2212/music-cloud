@@ -60,6 +60,9 @@ export async function createAccountCredentials(password, saltB64) {
     masterBits,
     authHash: b64.encode(authBits),
     recoveryKey: formatRecoveryKey(masterBits),
+    // Recovery bytes are the master bits themselves; both signup and login
+    // hash the RAW bytes so the comparison is consistent.
+    recoveryHash: await sha256B64(masterBits),
   };
 }
 

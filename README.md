@@ -64,18 +64,28 @@ What lands in the repo:
 
 ```
 data/
-  users/<h>.rec       encrypted account record (email, auth hash, salt)
-  ptr/<ph>.json       encrypted pointer: email hash → record filename
-  lib/<h>.json        encrypted library JSON (folders, items, metadata)
-  blob/<h>/<id>.json  manifest { iv, salt, size, parts }
-  blob/<h>/<id>/pN.enc  encrypted part N (~4 MB of plaintext each)
+  users.json          ALL accounts in one file. A public index maps
+                      SHA-256(email) → entry key; each entry is an
+                      AES-GCM envelope holding { email, auth hash,
+                      recovery hash, KDF salt, created }.
+  files/<h>.json      encrypted library JSON (folders, items, metadata)
+  files/<h>/<id>.json   manifest { iv, salt, size, parts }
+  files/<h>/<id>/pN.enc encrypted part N (~4 MB of plaintext each)
 ```
 
-`<h>` = SHA-256(email ':' authHash). The filename and the record's encryption
-key both require the email **and** the password, so the public repo leaks
-nothing usable. The KDF salt is deterministic per email (SHA-256 of a domain-
-separated email), which lets every device derive the same key with no pre-auth
-lookup.
+Entry keys = SHA-256(email ':' authHash) — computing one requires the email
+**and** the password, so the public repo leaks nothing usable. The KDF salt is
+deterministic per email, which lets every device derive the same key with no
+pre-auth lookup.
+
+Creating accounts from the terminal (no browser dance):
+
+```bash
+GITHUB_TOKEN=ghp_xxx node scripts/create-user.mjs friend@example.com 'their password'
+```
+
+Prints a recovery key to hand to the account owner. The token needs
+Contents: Read and write on this repo.
 
 Notes and limits:
 
