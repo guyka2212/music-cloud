@@ -64,10 +64,11 @@ What lands in the repo:
 
 ```
 data/
-  users/<h>.rec     encrypted account record (email, auth hash, salt)
-  ptr/<ph>.json     encrypted pointer: email hash → record filename
-  lib/<h>.json      encrypted library JSON (folders, items, metadata)
-  blob/<h>/<id>.enc encrypted audio file (up to ~15 MB per file)
+  users/<h>.rec       encrypted account record (email, auth hash, salt)
+  ptr/<ph>.json       encrypted pointer: email hash → record filename
+  lib/<h>.json        encrypted library JSON (folders, items, metadata)
+  blob/<h>/<id>.json  manifest { iv, salt, size, parts }
+  blob/<h>/<id>/pN.enc  encrypted part N (~4 MB of plaintext each)
 ```
 
 `<h>` = SHA-256(email ':' authHash). The filename and the record's encryption
@@ -80,7 +81,9 @@ Notes and limits:
 
 - Sign in with the same email + password on any device to reach the same
   library; recovery-key login works too (via the pointer file).
-- Files are capped at ~15 MB (GitHub's Contents API request limit).
+- There is no hard per-file size limit: each ~4 MB encrypted chunk is
+  committed as its own file, so storage scales with your repo (GitHub works
+  best below ~1–5 GB; huge libraries may hit API rate limits while loading).
 - Every save is a commit on `main`, so the repo's history grows with use —
   occasionally prune old `data/` blobs if it gets large.
 - GitHub API rate limits (5000 req/h authenticated) apply; normal listening

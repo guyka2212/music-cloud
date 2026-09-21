@@ -218,30 +218,41 @@ function hexToBytes(hex) {
 
 // ---------------------------------------------------------------- blobs
 
-function blobPath(h, id) { return `data/blob/${h}/${id}.enc`; }
+// Layout per blob (all ciphertext parts are independent AES-GCM payloads):
+//   data/blob/<h>/<id>.json      manifest { v, iv, salt, size, parts: N }
+//   data/blob/<h>/<id>/p0.enc    part 0 ciphertext (~4MB plaintext per part)
+//   data/blob/<h>/<id>/p1.enc    ...
+// One Contents commit per part sidesteps the API's 25MB request cap, so file
+// size is bounded only by patience (GitHub recommends repos stay under 1-5GB).
 
-async function putBlob(h, id, bytes, meta, message) {
-  const p = blobPath(h, id);
-  const sha = await getSha(p);
-  if (sha) return; // already uploaded; blobs are immutable
-  const envelope = {
-    v: 1,
+function blobManifestPath(h, id) { return `data/blob/${h}/${id}.json`; }
+function blobPartPath(h, id, i) { return `data/blob/${h}/${id}/p${i}.enc`; }
+const MAX_PARTS_DELETE = 10_000; // safety stop for blobDelete's part sweep
+
+async function putBlobManifest(h, id, meta, partCount, message) {
+  const manifest = {
+    v: 2,
     iv: meta.iv || '',
     salt: meta.salt || '',
-    ct: b64Encode(bytes),
+    size: meta.size || 0,
+    parts: partCount,
   };
-  await ghRequest('PUT', `/repos/${REPO}/contents/${encPath(p)}`, {
-    message,
-    branch: BRANCH,
-    content: b64Encode(enc.encode(JSON.stringify(envelope))),
-  });
+  await putFile(blobManifestPath(h, id), enc.encode(JSON.stringify(manifest)), message);
 }
 
-async function getBlob(h, id) {
-  const raw = await readFileRaw(blobPath(h, id));
-  const env = JSON.parse(new TextDecoder().decode(raw));
-  if (!env || !env.ct) throw new ApiError(404, 'Blob not found');
-  return env;
+async function getBlobManifest(h, id) {
+  const raw = await readFileRaw(blobManifestPath(h, id));
+  const m = JSON.parse(new TextDecoder().decode(raw));
+  if (!m || m.v !== 2) throw new ApiError(404, 'Blob not found');
+  return m;
+}
+
+async function putBlobPart(h, id, i, bytes) {
+  await putFile(blobPartPath(h, id, i), bytes, `mc: part ${id.slice(0, 10)}#${i}`);
+}
+
+async function getBlobPart(h, id, i) {
+  return readFileRaw(blobPartPath(h, id, i));
 }
 
 async function deleteRepoFile(path) {
@@ -258,7 +269,6 @@ export function makeGhApi() {
   let sessionEmail = null;
   let sessionH = null;
   let sessionAuthHash = null;
-  const pending = new Map(); // blobId -> Uint8Array[] chunks awaiting finalize
   const initMeta = new Map(); // blobId -> { salt, iv } from blobInit
 
   const session = () => {
@@ -351,55 +361,59 @@ export function makeGhApi() {
     },
 
     async putChunk(blobId, idx, bytes) {
-      session();
+      const s = session();
       const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-      // Chunks accumulate in memory and merge at finalize; the merged file
-      // must stay under the Contents API's 25MB request cap (~15MB plaintext).
-      const parts = pending.get(blobId) || [];
-      parts[idx] = b;
-      const total = parts.reduce((n, p) => n + (p ? p.length : 0), 0);
-      if (total > 15_000_000) {
-        throw new ApiError(413, 'Files up to about 15 MB work with GitHub sync. Larger files need the self-hosted server.');
-      }
-      pending.set(blobId, parts);
+      // Each chunk commits immediately as its own part file — nothing
+      // accumulates in memory and no total-size cap applies.
+      await putBlobPart(s.h, blobId, idx, b);
       return { ok: true };
     },
 
     async blobFinalize(blobId, size) {
       const s = session();
-      const parts = pending.get(blobId);
-      if (!parts) throw new ApiError(400, 'No chunks uploaded.');
-      pending.delete(blobId);
-      const total = parts.reduce((n, p) => n + p.length, 0);
-      const merged = new Uint8Array(total);
-      let o = 0;
-      for (const p of parts) { merged.set(p, o); o += p.length; }
       const meta = initMeta.get(blobId) || {};
       initMeta.delete(blobId);
-      await putBlob(s.h, blobId, merged, meta, `mc: blob ${blobId.slice(0, 10)} (${size}B)`);
+      // Verify every part landed before publishing the manifest.
+      let partCount = 0;
+      while (await getSha(blobPartPath(s.h, blobId, partCount))) partCount++;
+      if (!partCount) throw new ApiError(400, 'No chunks uploaded.');
+      await putBlobManifest(s.h, blobId, { ...meta, size }, partCount, `mc: blob ${blobId.slice(0, 10)} (${size}B, ${partCount} parts)`);
       return { ok: true };
     },
 
     async blobStatus(blobId) {
       const s = session();
-      // getSha resolves to null on 404 rather than throwing, so judge by result.
-      const sha = await getSha(blobPath(s.h, blobId));
+      const sha = await getSha(blobManifestPath(s.h, blobId));
       return { exists: Boolean(sha), complete: Boolean(sha), chunks: 0 };
     },
 
     async blobDelete(blobId) {
       const s = session();
-      await deleteRepoFile(blobPath(s.h, blobId));
+      // Best-effort: remove manifest then any parts that exist.
+      await deleteRepoFile(blobManifestPath(s.h, blobId));
+      for (let i = 0; i < MAX_PARTS_DELETE; i++) {
+        const exists = await getSha(blobPartPath(s.h, blobId, i));
+        if (!exists) break;
+        await deleteRepoFile(blobPartPath(s.h, blobId, i));
+      }
       return { ok: true };
     },
 
     async fetchBlob(blobId) {
       const s = session();
-      const env = await getBlob(s.h, blobId);
+      const m = await getBlobManifest(s.h, blobId);
+      // Fetch all parts in parallel and concatenate in order.
+      const requests = [];
+      for (let i = 0; i < m.parts; i++) requests.push(getBlobPart(s.h, blobId, i));
+      const partBytes = await Promise.all(requests);
+      const total = partBytes.reduce((n, p) => n + p.length, 0);
+      const merged = new Uint8Array(total);
+      let o = 0;
+      for (const p of partBytes) { merged.set(p, o); o += p.length; }
       return {
         ok: true,
-        headers: new Headers({ 'X-Blob-Iv': env.iv, 'X-Blob-Salt': env.salt || '' }),
-        arrayBuffer: async () => b64Decode(env.ct).buffer,
+        headers: new Headers({ 'X-Blob-Iv': m.iv, 'X-Blob-Salt': m.salt || '' }),
+        arrayBuffer: async () => merged.buffer,
       };
     },
   };

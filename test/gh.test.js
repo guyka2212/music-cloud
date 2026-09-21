@@ -124,6 +124,19 @@ assert(got.headers.get('X-Blob-Iv') === 'fiv-a', 'blob IV exposed via header');
 await a.blobDelete('blob-1');
 assert((await a.blobStatus('blob-1')).exists === false, 'blob delete works');
 
+// ---- multi-part blob (no storage cap) ------------------------------------
+const part = new Uint8Array(512).map((_, i) => (i * 7) % 256);
+await a.blobInit('blob-big', 'fsalt-big', 'fiv-big');
+for (let i = 0; i < 3; i++) await a.putChunk('blob-big', i, part);
+await a.blobFinalize('blob-big', 512 * 3);
+const big = await a.fetchBlob('blob-big');
+const bigBytes = new Uint8Array(await big.arrayBuffer());
+assert(bigBytes.length === 512 * 3, 'multi-part blob reassembles to full size');
+assert(bigBytes[0] === 0 && bigBytes[512] === 0 && bigBytes[1024] === 0, 'multi-part ordering correct');
+assert(big.headers.get('X-Blob-Iv') === 'fiv-big', 'multi-part manifest exposes IV');
+await a.blobDelete('blob-big');
+assert((await a.blobStatus('blob-big')).exists === false, 'multi-part blob delete works');
+
 // ---- account B: isolation ------------------------------------------------
 const b = makeGhApi();
 await b.signup('b@test.dev', 'authhash-b', 'recoveryhash-b', (await b.salt('b@test.dev')).salt);
