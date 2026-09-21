@@ -270,9 +270,22 @@ function showRecoveryKeyDialog(recoveryKey) {
 
 /* ================================================================ boot + start */
 
+let currentEmail = null; // display only; the real session lives in the driver
+
 async function startApp(masterBits) {
   // The derived key lives in memory only; a page refresh asks for the password
   // again. That is the standard tradeoff for end-to-end encrypted apps.
+  // Re-verify the session server-side (or driver-side) before rendering —
+  // a dashboard must never appear without a confirmed authenticated session.
+  try {
+    const me = await api.me();
+    if (!me || !me.user) throw new Error('Session missing');
+    currentEmail = me.user.email || currentEmail;
+  } catch (err) {
+    showAuth({ mode: 'login' });
+    if (err && err.message && err.message !== 'Session missing') throw err;
+    return;
+  }
   await store.load(masterBits);
   buildShell();
   render();
@@ -402,6 +415,7 @@ function buildSidebar(sidebar) {
     el('div', { class: 'side-footer' },
       el('button', { class: 'icon-btn', 'aria-label': 'Toggle light or dark theme', onclick: toggleTheme }),
       el('button', { class: 'side-link small', type: 'button', onclick: signOut }, icon('log-out', 16), el('span', { text: 'Sign out' })),
+      currentEmail ? el('div', { class: 'side-email', title: currentEmail, text: currentEmail }) : null,
     ),
   );
 

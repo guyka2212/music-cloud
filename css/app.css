@@ -827,6 +827,15 @@ button.crumb:hover { background: var(--surface-2); color: var(--text); }
   .auth-card { padding: var(--s-5); }
 }
 
+.side-email {
+  font-size: 12px;
+  color: var(--text-3);
+  padding: 0 12px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
