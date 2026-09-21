@@ -1,12 +1,18 @@
-// Data layer. Two interchangeable backends behind one interface:
+// Data layer. Three interchangeable backends behind one interface:
 //
 //   server — the zero-dependency Node server in /server (self-hosting).
 //   local  — everything in the browser: users, library docs, and encrypted
 //            blobs live in IndexedDB. Used on static hosting (GitHub Pages)
 //            where no backend can run.
+//   github — data files live under data/ in the GitHub repo, read/written
+//            through the Contents API with a user-pasted token. Cross-device.
 //
-// Selection: localStorage 'mc-backend' = 'server' | 'local' | 'auto' (default).
-// In auto mode we probe the server once at boot.
+// Selection: localStorage 'mc-backend' = 'server' | 'local' | 'github' | 'auto'.
+// In auto mode we probe the server once at boot; on a static host without a
+// stored preference we default to local.
+
+import { makeGhApi } from './gh.js';
+
 
 class ApiError extends Error {
   constructor(status, message) {
@@ -336,6 +342,7 @@ export async function selectBackend() {
   if (!probing) {
     probing = (async () => {
       const pref = localStorage.getItem('mc-backend') || 'auto';
+      if (pref === 'github') return makeGhApi();
       if (pref === 'local') return makeLocalApi();
       if (pref === 'server' && !isStaticHost()) return makeServerApi();
       if (pref === 'server') {

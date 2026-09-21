@@ -44,6 +44,48 @@ is no backend, so the app runs in **local mode**:
 - Encryption is identical to server mode — the password never leaves the
   device in either mode.
 
+### GitHub sync mode (cross-device on Pages)
+
+Local mode ties your library to one browser. **GitHub sync** removes that
+limit while staying 100% static: data files live under `data/` **in this
+repo**, read and written through GitHub's Contents API.
+
+To enable it, click **“Use GitHub sync”** on the sign-in page and paste a
+token:
+
+1. GitHub → Settings → Developer settings → **Fine-grained tokens** →
+   Generate new token.
+2. Repository access: select **music-cloud** only.
+3. Permissions: **Contents → Read and write** (nothing else needed).
+4. Paste the token into the dialog. It is stored in that browser's
+   localStorage only — never committed, never sent anywhere but api.github.com.
+
+What lands in the repo:
+
+```
+data/
+  users/<h>.rec     encrypted account record (email, auth hash, salt)
+  ptr/<ph>.json     encrypted pointer: email hash → record filename
+  lib/<h>.json      encrypted library JSON (folders, items, metadata)
+  blob/<h>/<id>.enc encrypted audio file (up to ~15 MB per file)
+```
+
+`<h>` = SHA-256(email ':' authHash). The filename and the record's encryption
+key both require the email **and** the password, so the public repo leaks
+nothing usable. The KDF salt is deterministic per email (SHA-256 of a domain-
+separated email), which lets every device derive the same key with no pre-auth
+lookup.
+
+Notes and limits:
+
+- Sign in with the same email + password on any device to reach the same
+  library; recovery-key login works too (via the pointer file).
+- Files are capped at ~15 MB (GitHub's Contents API request limit).
+- Every save is a commit on `main`, so the repo's history grows with use —
+  occasionally prune old `data/` blobs if it gets large.
+- GitHub API rate limits (5000 req/h authenticated) apply; normal listening
+  uses very few requests.
+
 ## How the encryption works
 
 Everything the user stores is encrypted **in the browser**, before it is sent

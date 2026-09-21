@@ -58,6 +58,9 @@ function showAuth({ mode = 'login' } = {}) {
     error,
   );
 
+  const localMode = backendKind() === 'local';
+  const ghMode = backendKind() === 'github';
+
   const card = el('div', { class: 'auth-card' },
     el('div', { class: 'brand' }, icon('music', 20), el('span', { text: 'music cloud' })),
     el('h1', { class: 'auth-title', text: isSignup ? 'Create your library' : 'Sign in' }),
@@ -71,17 +74,22 @@ function showAuth({ mode = 'login' } = {}) {
         text: isSignup ? 'Already have an account? Sign in' : 'Need an account? Create one',
         onclick: () => showAuth({ mode: isSignup ? 'login' : 'signup' }),
       }),
+      ghMode
+        ? el('button', { class: 'linklike', type: 'button', text: 'Stop using GitHub sync for this browser', onclick: disableGhMode })
+        : el('button', { class: 'linklike', type: 'button', text: 'Use GitHub sync (same library on every device)', onclick: showGhSetup }),
     ),
   );
 
-  const localMode = backendKind() === 'local';
   const aside = el('aside', { class: 'auth-aside' },
     el('h2', { class: 'aside-title', text: 'End-to-end encrypted' }),
-    el('p', {}, localMode
-      ? 'This is the static build: your account, library, and encrypted audio live in this browser (IndexedDB). Your password derives the key — it is never stored or uploaded.'
-      : 'Your password never leaves this device. It derives the key that encrypts your library and files. The server stores ciphertext only.'),
+    el('p', {}, ghMode
+      ? 'GitHub sync: your encrypted library and account record are stored in the music-cloud repo (data/ folder). A GitHub token in this browser authorizes the commits; your password never leaves this device.'
+      : localMode
+        ? 'This is the static build: your account, library, and encrypted audio live in this browser (IndexedDB). Your password derives the key — it is never stored or uploaded.'
+        : 'Your password never leaves this device. It derives the key that encrypts your library and files. The server stores ciphertext only.'),
     el('p', {}, 'No password, no access — there is no reset. A recovery key is shown once at signup; keep it somewhere safe.'),
     localMode ? el('p', { class: 'hint' }, 'Because data lives in this browser, clearing site data deletes the library. Use the same browser profile to return to it.') : null,
+    ghMode ? el('p', { class: 'hint' }, 'Sign in with the same email and password on any device to reach the same library.') : null,
   );
 
   root.append(el('div', { class: 'auth-wrap' },
@@ -103,7 +111,11 @@ function showAuth({ mode = 'login' } = {}) {
       const pw = password.value;
       if (pw.length < 8) throw new Error('Password must be at least 8 characters.');
       if (isSignup) {
-        const salt = await generateSalt();
+        // GitHub mode uses a deterministic per-email salt so every device
+        // derives the same key without a pre-auth lookup.
+        const salt = backendKind() === 'github'
+          ? (await api.salt(email.value.trim())).salt
+          : await generateSalt();
         const { authHash, recoveryKey } = await createAccountCredentials(pw, salt);
         const recoveryHash = await sha256B64Url(utf8.encode(recoveryKey));
         await api.signup(email.value.trim(), authHash, recoveryHash, salt);
@@ -134,6 +146,52 @@ function showAuth({ mode = 'login' } = {}) {
 async function sha256B64Url(bytes) {
   const d = await crypto.subtle.digest('SHA-256', bytes);
   return b64.encode(new Uint8Array(d));
+}
+
+function showGhSetup() {
+  const tokenInput = el('input', { class: 'input', type: 'password', placeholder: 'github_pat_… or ghp_…', id: 'gh-token' });
+  const err = el('p', { class: 'form-error', role: 'alert' });
+  openDialog({
+    title: 'Use GitHub sync',
+    width: 520,
+    body: el('div', {},
+      el('p', { class: 'dialog-message' },
+        'GitHub sync stores your encrypted library in the music-cloud repo so the same account works on every device. You need a GitHub token with Contents: read and write for this repository.'),
+      el('p', { class: 'hint' },
+        'Create a fine-grained token at GitHub → Settings → Developer settings → Fine-grained tokens. Select only this repository, permission “Contents: Read and write”. The token is kept in this browser only.'),
+      el('div', { class: 'field' }, el('label', { class: 'field-label', for: 'gh-token', text: 'GitHub token' }), tokenInput),
+      err,
+    ),
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Save and reload', kind: 'primary',
+        onClick: async (close) => {
+          const t = tokenInput.value.trim();
+          if (!t) { err.textContent = 'Paste a token first.'; return; }
+          try {
+            const r = await fetch('https://api.github.com/repos/guyka2212/music-cloud', {
+              headers: { Authorization: `Bearer ${t}`, Accept: 'application/vnd.github+json' },
+            });
+            if (r.status === 401) throw new Error('GitHub rejected this token (401).');
+            if (!r.ok) throw new Error(`Token check failed (${r.status}). Make sure it can access guyka2212/music-cloud.`);
+            localStorage.setItem('mc-gh-token', t);
+            localStorage.setItem('mc-backend', 'github');
+            close();
+            location.reload();
+          } catch (e2) {
+            err.textContent = e2.message;
+          }
+        },
+      },
+    ],
+  });
+}
+
+function disableGhMode() {
+  localStorage.removeItem('mc-backend');
+  localStorage.removeItem('mc-gh-token');
+  location.reload();
 }
 
 function showRecoveryLogin() {
