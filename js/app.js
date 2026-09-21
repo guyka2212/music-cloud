@@ -1025,3 +1025,8 @@ onUploadProgress((job) => {
   }
   renderUploadsPanel();
 });
+
+/* ================================================================ boot */
+
+boot();
+void backendKind;
