@@ -1,10 +1,15 @@
-// Tiny HTTP router: pattern-matched API dispatch plus static file serving for public/.
+// Tiny HTTP router: pattern-matched API dispatch plus static file serving.
+// Static assets live in the repo root (same layout GitHub Pages serves), so
+// self-hosting and Pages host identical files.
 import path from 'node:path';
 import fs from 'node:fs';
 import url from 'node:url';
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-const publicDir = path.join(__dirname, '..', 'public');
+const publicDir = path.join(__dirname, '..');
+
+// Never serve these over HTTP.
+const DENY = new Set(['server', 'test', 'node_modules', '.git', 'data', 'data-test', 'data-smoke']);
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -21,15 +26,18 @@ const MIME = {
 
 function serveStatic(req, res, pathname) {
   const safe = path.normalize(pathname).replace(/^(\.\.[/\\])+/, '');
+  const firstSeg = safe.split(/[/\\]/)[0] || '';
   const candidates = safe === '/' ? ['index.html'] : [safe, `${safe}index.html`, `${safe.replace(/\/$/, '')}.html`];
   let filePath = null;
   for (const c of candidates) {
+    if (DENY.has(c.split(/[/\\]/)[0])) break; // never leak server/test/data files
     const p = path.join(publicDir, c);
     if (!p.startsWith(publicDir)) continue; // path traversal guard
     try {
       if (fs.statSync(p).isFile()) { filePath = p; break; }
     } catch { /* keep looking */ }
   }
+  void firstSeg;
   if (!filePath) {
     // SPA fallback — the client app resolves unknown paths itself.
     filePath = path.join(publicDir, 'index.html');

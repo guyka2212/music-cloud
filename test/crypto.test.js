@@ -7,7 +7,7 @@ import {
   encryptJson, decryptJson, makeFileKeyRecord, unwrapFileKey,
   encryptWithIv, decryptWithIv, deriveChunkIv, formatRecoveryKey, parseRecoveryKey,
   generateSalt, CHUNK_SIZE,
-} from '../public/js/crypto.js';
+} from '../js/crypto.js';
 
 const pw = 'correct horse battery staple 9!';
 const salt = await generateSalt();

@@ -1,6 +1,6 @@
 // App shell and views. Single page: auth -> unlock -> library.
 
-import { api } from './api.js';
+import { api, selectBackend, backendKind } from './api.js';
 import { store } from './store.js';
 import {
   createAccountCredentials, loginCredentialsWithPassword, loginCredentialsWithRecovery,
@@ -74,10 +74,14 @@ function showAuth({ mode = 'login' } = {}) {
     ),
   );
 
+  const localMode = backendKind() === 'local';
   const aside = el('aside', { class: 'auth-aside' },
     el('h2', { class: 'aside-title', text: 'End-to-end encrypted' }),
-    el('p', {}, 'Your password never leaves this device. It derives the key that encrypts your library and files. The server stores ciphertext only.'),
-    el('p', {}, 'No password, no access — there is no server-side reset. A recovery key is shown once at signup; keep it somewhere safe.'),
+    el('p', {}, localMode
+      ? 'This is the static build: your account, library, and encrypted audio live in this browser (IndexedDB). Your password derives the key — it is never stored or uploaded.'
+      : 'Your password never leaves this device. It derives the key that encrypts your library and files. The server stores ciphertext only.'),
+    el('p', {}, 'No password, no access — there is no reset. A recovery key is shown once at signup; keep it somewhere safe.'),
+    localMode ? el('p', { class: 'hint' }, 'Because data lives in this browser, clearing site data deletes the library. Use the same browser profile to return to it.') : null,
   );
 
   root.append(el('div', { class: 'auth-wrap' },
@@ -211,8 +215,9 @@ async function startApp(masterBits) {
 
 async function boot() {
   setupThemeToggle();
-  // The session cookie may still be valid, but the encryption key only exists
-  // after this device derives it — so the password is always required here.
+  await selectBackend();
+  // The session may still be valid, but the encryption key only exists after
+  // this device derives it — so the password is always required here.
   showAuth({ mode: 'login' });
 }
 

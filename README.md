@@ -2,23 +2,54 @@
 
 Private, end-to-end encrypted cloud storage for your music. Google-Drive-style
 organization — folders, search, drag-and-drop, trash — with a player built for
-audio, and a server that never sees a single plaintext byte.
+audio. Works two ways:
 
-## Quick start
+- **GitHub Pages (static)** — everything runs in your browser; your account,
+  library, and encrypted audio live in that browser's IndexedDB. Nothing is
+  ever uploaded anywhere.
+- **Self-hosted** — `npm start` and the same app uses the zero-dependency
+  Node server: encrypted data stored server-side, accessible from any device.
+
+The same frontend drives both; it probes for the server and falls back to
+local-only mode automatically.
+
+## Run it
 
 ```bash
+# Static (GitHub Pages) — no build step, no server needed:
+#   push this repo, enable Pages on main / root. Done.
+
+# Self-hosted:
 npm start          # serves on http://localhost:8080
 PORT=3000 npm start
-npm test           # end-to-end server contract tests (client crypto simulated)
+
+npm test           # crypto tests + local-driver tests + server contract tests
 ```
 
-No runtime dependencies. Requires Node 22.5+ (uses built-in `node:sqlite`).
+## GitHub Pages
+
+1. Push this repository to GitHub.
+2. Settings → Pages → Source: **Deploy from a branch**, Branch: **main**,
+   Folder: **/ (root)** → Save.
+3. Your library is live at `https://<user>.github.io/<repo>/`.
+
+`index.html` uses relative asset paths, so the app works at a project
+subpath. `.nojekyll` is included so Pages serves files as-is. On Pages there
+is no backend, so the app runs in **local mode**:
+
+- Accounts, the encrypted library JSON, and encrypted audio files are stored
+  in the browser's IndexedDB (stores: `users`, `library`, `blobs`, `chunks`).
+- Each browser profile is its own "server": data does not sync across devices
+  or browsers, and clearing site data deletes it.
+- Encryption is identical to server mode — the password never leaves the
+  device in either mode.
 
 ## How the encryption works
 
-Everything the user stores is encrypted **in the browser**, before it is sent.
-The server stores only ciphertext and can neither read your library nor help
-you recover it.
+Everything the user stores is encrypted **in the browser**, before it is sent
+(or, in local mode, before it touches disk). The server — when there is one —
+stores only ciphertext and can neither read your library nor help you recover
+it.
 
 | Secret | Derived from | Used for | Leaves the device? |
 |---|---|---|---|
@@ -30,8 +61,7 @@ you recover it.
 - Library JSON (folders, names, metadata, settings) = one AES-256-GCM document.
 - Files >4 MB are encrypted and uploaded in independent 4 MB GCM chunks
   (per-chunk IV = file IV XOR chunk index); smaller files are single-shot.
-- Playback and downloads are decrypted in the browser via `/blob/:id`, which
-  streams ciphertext back to an authenticated session only.
+- Playback and downloads are decrypted in the browser on demand.
 
 Losing the password *and* the recovery key means the data is unrecoverable —
 by design. The signup screen says so plainly and offers a downloadable
@@ -39,15 +69,14 @@ recovery key.
 
 ## Features
 
-- Email + password accounts, HttpOnly session cookies, per-email lockout and
-  IP rate limits on auth routes.
 - **+ New** dropdown: new folder / upload music / upload any file — keyboard
   navigable, closes on Escape or outside click.
 - Uploads: any format, no extension rejection. Metadata (title, artist, album,
   duration, cover art) parsed client-side for ID3v2, FLAC, MP4/M4A; WAV
   duration from the header. Per-file progress with cancel; drag-and-drop
   anywhere.
-- Folders: nest, rename, move (drag-drop or dialog), trash/restore/purge.
+- Folders: nest, rename, move (drag-drop or dialog), trash/restore/purge;
+  download a folder as a .zip (built locally).
 - Views: list (name, artist, duration, size, modified) and grid; sort by name,
   date, size, artist; library-wide search.
 - Player: persistent bottom bar, folder-scoped queue, prev/next, seek, volume,
@@ -57,12 +86,13 @@ recovery key.
 - Light and dark themes designed separately; responsive with a drawer sidebar
   and FAB on mobile; reduced-motion supported.
 
-## API surface
+## API surface (server mode)
 
 | Route | Purpose |
 |---|---|
-| `POST /api/auth/signup` | `{ email, authHash, recoveryHash }` |
+| `POST /api/auth/signup` | `{ email, authHash, recoveryHash, kdfSalt }` |
 | `POST /api/auth/login` | `{ email, authHash }` or `{ email, recoveryHash }` |
+| `GET /api/auth/salt?email=` | Public per-account KDF salt for key derivation |
 | `POST /api/auth/logout`, `GET /api/auth/me` | Session lifecycle |
 | `GET/PUT /api/library` | The encrypted library document (`salt`, `iv`, `ct`) |
 | `POST /api/blob/:id/init` | Start an upload (`salt`, base64 IV) |
@@ -77,7 +107,7 @@ Every blob route is scoped by the session user; cross-account access returns
 ## Layout
 
 ```
-server/   db, auth, blob routes, static router (zero dependencies)
-public/   ES-module frontend: crypto, store, uploader, player, UI
-test/     contract tests that simulate the browser's crypto end to end
+index.html, js/, css/   the app (served by Pages *and* by the Node server)
+server/                 zero-dependency Node backend (opt-in: npm start)
+test/                   crypto, local-driver, and server contract tests
 ```
