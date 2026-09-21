@@ -1,6 +1,4 @@
 node_modules/
-data/
-test-data/
 *.log
 .DS_Store
 .env
