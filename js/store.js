@@ -30,11 +30,15 @@ export const store = {
   async load() {
     const res = await api.getLibrary();
     if (!res || !res.folders || !res.folders.root) {
+      // Missing library (first run): start empty in memory. Deliberately no
+      // write here — loading must work without a token. The library file is
+      // created by the first real change (upload, new folder), which is the
+      // moment write access is actually required.
       this.doc = EMPTY_LIBRARY();
       this.doc.folders.root = {
         id: 'root', name: 'Shared Music', parent: null, createdAt: Date.now(), trashed: false,
       };
-      await this.save(null, 'mc: init library');
+      this.lastSaved = JSON.stringify(this.doc);
       return this.doc;
     }
     this.doc = res;
