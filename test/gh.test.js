@@ -42,17 +42,39 @@ function jsonResponse(obj, status = 200) {
 
 globalThis.fetch = async (url, opts = {}) => {
   const u = new URL(url);
-  const path = decodeURIComponent(u.pathname.replace(/^\/repos\/[^/]+\/[^/]+\/contents/, ''));
+  // raw.githubusercontent.com/<owner>/<repo>/<branch>/data/... (reads, no auth)
+  // api.github.com/repos/<owner>/<repo>/contents/data/... (writes, token needed)
+  let path = null;
+  let isRaw = false;
+  if (u.hostname === 'raw.githubusercontent.com') {
+    isRaw = true;
+    path = '/' + u.pathname.split('/').slice(4).join('/');
+  } else {
+    path = decodeURIComponent(u.pathname.replace(/^\/repos\/[^/]+\/[^/]+\/contents/, ''));
+    if (!path.startsWith('/')) path = '/' + path;
+  }
   const method = (opts.method || 'GET').toUpperCase();
 
   if (method === 'GET') {
-    if (!files.has(path)) return jsonResponse({ message: 'Not Found' }, 404);
+    if (!files.has(path)) {
+      return isRaw
+        ? { ok: false, status: 404, json: async () => ({ message: 'Not Found' }) }
+        : jsonResponse({ message: 'Not Found' }, 404);
+    }
+    if (isRaw) {
+      const bytes = b64d(files.get(path).content);
+      return { ok: true, status: 200, arrayBuffer: async () => bytes.slice().buffer, headers: { get: () => 'application/octet-stream' } };
+    }
     const accept = opts.headers?.Accept || '';
     if (accept.includes('raw')) {
       const bytes = b64d(files.get(path).content);
       return { ok: true, status: 200, arrayBuffer: async () => bytes.slice().buffer, headers: { get: () => 'application/vnd.github.raw' } };
     }
     return jsonResponse({ sha: `sha-${path}`, type: 'file' });
+  }
+
+  if (!lstore.get('mc-gh-token')) {
+    return jsonResponse({ message: 'Requires authentication' }, 401);
   }
 
   if (method === 'PUT') {
@@ -86,8 +108,12 @@ function assert(cond, msg) {
 
 const api = makeGhApi();
 
-// ---- library --------------------------------------------------------------
+// Reads work anonymously; writes are rejected without a token.
 assert((await api.getLibrary()) === null, 'empty repo reports no library');
+let denied = false;
+try { await api.saveLibrary({ junk: true }, 'nope'); } catch (e) { denied = e.status === 401; }
+assert(denied, 'writes are rejected without a token (401)');
+lstore.set('mc-gh-token', 'test-token'); // owner writes from here on
 
 const doc = { version: 1, root: 'root', folders: { root: { id: 'root', name: 'Shared Music' } }, items: {} };
 await api.saveLibrary(doc, 'mc: test init');

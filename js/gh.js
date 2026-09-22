@@ -33,7 +33,23 @@ class ApiError extends Error {
   }
 }
 
+function failWrite() {
+  throw new ApiError(401, 'Uploading is owner-only. This library is read-only in your browser.');
+}
+
 // ---------------------------------------------------------------- request core
+
+// All reads go through raw.githubusercontent.com — a CDN with no token and no
+// rate limit — so anonymous visitors can never hit the API's 60/hour cap.
+async function readRawUrl(path) {
+  const res = await fetch(`https://raw.githubusercontent.com/${REPO}/${BRANCH}/${path.split('/').map(encodeURIComponent).join('/')}`);
+  if (!res.ok) {
+    const e = new Error(res.status === 404 ? 'Not Found' : `raw fetch ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  return res;
+}
 
 export async function ghRequest(method, path, body, raw = false) {
   const headers = {
@@ -93,11 +109,12 @@ async function getSha(path) {
 }
 
 export async function readFileRaw(path) {
-  const r = await ghRequest('GET', `/repos/${REPO}/contents/${encPath(path)}?ref=${BRANCH}`, undefined, true);
+  const r = await readRawUrl(path);
   return new Uint8Array(await r.arrayBuffer());
 }
 
-export async function putFile(path, bytes, message) {
+async function putFile(path, bytes, message) {
+  if (!ghToken()) failWrite();
   const sha = await getSha(path);
   const body = { message, branch: BRANCH, content: b64Encode(bytes) };
   if (sha) body.sha = sha;
@@ -141,6 +158,7 @@ export function makeGhApi() {
     },
 
     async blobInit(blobId) {
+      if (!ghToken()) failWrite();
       const sha = await getSha(filesPath(blobId));
       if (sha) throw new ApiError(409, 'A file with this id already exists.');
       return { ok: true };
