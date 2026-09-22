@@ -38,53 +38,9 @@ const state = {
 
 let canWrite = false; // true once a write-capable token is set
 
-function showTokenSetup() {
-  const tokenInput = el('input', { class: 'input', type: 'password', placeholder: 'github_pat_… or ghp_…', id: 'gh-token' });
-  const err = el('p', { class: 'form-error', role: 'alert' });
-  openDialog({
-    title: 'Enable uploading',
-    width: 520,
-    body: el('div', {},
-      el('p', { class: 'dialog-message' },
-        'Anyone can browse and play this library. To upload or make changes, paste a GitHub token with “Contents: Read and write” for the music-cloud repo. The token stays in this browser only.'),
-      el('p', { class: 'hint' },
-        'Create one at GitHub → Settings → Developer settings → Fine-grained tokens. Select only this repository.'),
-      el('div', { class: 'field' }, el('label', { class: 'field-label', for: 'gh-token', text: 'GitHub token' }), tokenInput),
-      err,
-    ),
-    actions: [
-      { label: 'Cancel', onClick: (close) => close() },
-      {
-        label: 'Save and reload', kind: 'primary',
-        onClick: async (close) => {
-          const t = tokenInput.value.trim();
-          if (!t) { err.textContent = 'Paste a token first.'; return; }
-          try {
-            const r = await fetch('https://api.github.com/repos/guyka2212/music-cloud', {
-              headers: { Authorization: `Bearer ${t}`, Accept: 'application/vnd.github+json' },
-            });
-            if (r.status === 401) throw new Error('GitHub rejected this token (401).');
-            if (!r.ok) throw new Error(`Token check failed (${r.status}). Make sure it can access guyka2212/music-cloud.`);
-            const repo = await r.json();
-            if (!repo.permissions || repo.permissions.push !== true) {
-              throw new Error('This token can read but not write. Re-create it with permission “Contents: Read and write”.');
-            }
-            localStorage.setItem('mc-gh-token', t);
-            close();
-            location.reload();
-          } catch (e2) {
-            err.textContent = e2.message;
-          }
-        },
-      },
-    ],
-  });
-}
-
-function disableWriteAccess() {
-  localStorage.removeItem('mc-gh-token');
-  location.reload();
-}
+// Write access is configured once per browser via the console (see README):
+//   localStorage.setItem('mc-gh-token', 'github_pat_…'); location.reload();
+// There is no token UI on the page — the site is just a dashboard.
 
 async function boot() {
   setupThemeToggle();
@@ -103,7 +59,7 @@ async function boot() {
 function renderLoadError(err) {
   const root = document.getElementById('app');
   const msg = (err && err.status === 403)
-    ? 'GitHub rate limit reached for anonymous requests. Add a token (it raises the limit and enables uploading).'
+    ? 'GitHub rate limit reached for anonymous requests. Refresh in a minute, or set a token in this browser (see README).'
     : 'Could not load the shared library from GitHub. Check your connection and refresh.';
   root.replaceChildren(el('div', { class: 'auth-wrap' },
     el('main', { class: 'auth-main' },
@@ -112,8 +68,7 @@ function renderLoadError(err) {
         el('h1', { class: 'auth-title', text: 'Library unavailable' }),
         el('p', { class: 'auth-sub', text: msg }),
         el('div', { class: 'auth-switch' },
-          el('button', { class: 'btn primary', type: 'button', text: 'Retry', onclick: () => location.reload() }),
-          el('button', { class: 'linklike', type: 'button', text: 'Add a token', onclick: showTokenSetup }))),
+          el('button', { class: 'btn primary', type: 'button', text: 'Retry', onclick: () => location.reload() }))),
     ),
   ));
 }
@@ -219,7 +174,7 @@ function buildSidebar(sidebar) {
   const meter = el('div', { class: 'storage-meter' }, meterBar, meterLabel);
   const hint = el('div', { class: 'side-hint', text: canWrite
     ? 'Uploading enabled — changes save to the shared repo.'
-    : 'Read-only: browse and play. Enable uploading to add files.' });
+    : 'Read-only: browse and play.' });
 
   sidebar.append(
     el('div', { class: 'side-top' },
@@ -231,8 +186,6 @@ function buildSidebar(sidebar) {
     hint,
     el('div', { class: 'side-footer' },
       el('button', { class: 'icon-btn', 'aria-label': 'Toggle light or dark theme', onclick: toggleTheme }),
-      el('button', { class: 'side-link small', type: 'button', onclick: canWrite ? disableWriteAccess : showTokenSetup },
-        icon('key', 16), el('span', { text: canWrite ? 'Disable uploading' : 'Enable uploading' })),
     ),
   );
 

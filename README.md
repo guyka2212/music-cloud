@@ -1,9 +1,10 @@
 # music cloud
 
 A shared, browser-based music library that lives entirely in a GitHub repo.
-No accounts, no server: every visitor sees the same library, can browse
-folders, and play anything the browser can decode. File uploads and edits are
-unlocked by pasting a GitHub token with write access.
+No accounts, no sign-in, no server: every visitor lands straight on the
+dashboard, sees the same library, and can browse folders and play anything the
+browser can decode. The site is just a dashboard — there is no user system of
+any kind.
 
 Live at: https://guyka2212.github.io/music-cloud/
 
@@ -19,10 +20,19 @@ data/
 - **Reading is anonymous.** Visitors fetch `data/library.json` and file parts
   straight from GitHub's Contents API — no token, no login, nothing sent
   anywhere else.
-- **Writing needs a token.** Click **"Enable uploading"** (key icon, bottom
-  left) and paste a fine-grained token for this repo with **Contents: Read and
-  write**. It is stored in that browser's localStorage only. Every change is a
-  commit to `main`.
+- **Writing needs a token, set from the console (owner only, no UI).** The page
+  has no token dialog — you (the owner) enable uploading in your own browser
+  once, via DevTools (F12) → Console:
+
+  ```js
+  localStorage.setItem('mc-gh-token', 'github_pat_yourtoken'); location.reload();
+  ```
+
+  Use a fine-grained token for this repo with **Contents: Read and write**
+  (GitHub → Settings → Developer settings → Fine-grained tokens). It is stored
+  in that browser's localStorage only and is never committed to the repo —
+  GitHub's secret scanning would auto-revoke any token found in a commit. Every
+  change is a commit to `main`. Everyone else stays read-only.
 - **No encryption, by design.** The library is meant to be public — the repo
   itself is the shared storage. Don't upload anything you wouldn't put on a
   public playlist.
